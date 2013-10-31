@@ -22,6 +22,7 @@ class StateMachine:
          try:
             read = self.current_state(read)
          except StateTerminate:
+            #print '[DEBUG] Hit StateTerminate.'
             break
 
 class SSHPatternMachine(StateMachine):
@@ -70,6 +71,10 @@ class SSHPatternMachine(StateMachine):
 
       if pc == '*':
          self.pattern_pointer = tape_index+1
+
+         if self.pattern_pointer >= len(self.tape):
+            raise StateTerminate
+
          self.match_pointer = self.match_index+1
          return self.pattern_pointer
       elif pc == mc or pc == '?':
@@ -117,16 +122,7 @@ class SSHConfigMachine(StateMachine):
       data = fp.read()
       fp.close()
 
-      self.current_hosts = ["*"]
-      self.current_keyword = None
-      self.current_argument = None
-      self.current_arguments = None
-      self.current_line = 1
       self.target_host = target_host
-
-      self.static_configs = dict()
-      self.pattern_configs = dict()
-
       StateMachine.__init__(self, data, self.init_state)
 
    def run(self):
@@ -135,6 +131,33 @@ class SSHConfigMachine(StateMachine):
       except IndexError:
          pass
 
+   def init_state(self, tape_index):
+      self.current_hosts = ["*"]
+      self.current_keyword = None
+      self.current_argument = None
+      self.current_arguments = None
+      self.current_line = 1
+
+      self.config = dict()
+      self.current_state = self.read_state
+      return tape_index
+
+   def read_state(self, tape_index):
+      c = self.tape[tape_index]
+
+      if c == '\n':
+         self.current_line += 1
+
+      if c in self.ALL_WHITESPACE:
+         return tape_index+1
+      elif c == '#':
+         self.current_state = self.comment
+      else:
+         self.current_keyword = list()
+         self.current_state = self.keyword
+
+      return tape_index
+
    def comment(self, tape_index):
       c = self.tape[tape_index]
 
@@ -142,47 +165,6 @@ class SSHConfigMachine(StateMachine):
          return tape_index+1
       else:
          self.current_state = self.entry_whitespace
-
-      return tape_index
-
-   def entry_whitespace(self, tape_index):
-      c = self.tape[tape_index]
-
-      if not self.current_keyword is None and self.current_argument is None and self.current_arguments is None:
-         raise StateError("unexpected end-of-line parsing %s for %s. (line %d)" % (self.current_keyword, ', '.join(self.current_hosts), self.current_line))
-      if c in self.ALL_WHITESPACE and self.current_keyword is None:
-         self.current_state = self.init_state
-         return tape_index
-
-      if self.current_argument:
-         self.current_argument = ''.join(self.current_argument)
-
-         if self.current_arguments is None:
-            self.current_arguments = [self.current_argument]
-         else:
-            self.current_arguments.append(self.current_argument)
-
-      self.store_keyword()
-      self.current_state = self.init_state
-
-      self.current_keyword = None
-      self.current_argument = None
-      self.current_arguments = None
-      self.current_line += 1
-
-      return tape_index+1
-
-   def line_whitespace(self, tape_index):
-      c = self.tape[tape_index]
-
-      if c in self.LINE_WHITESPACE:
-         return tape_index+1
-      elif c == '#':
-         self.current_state = self.comment
-      elif c in self.ENTRY_WHITESPACE:
-         self.current_state = self.entry_whitespace
-      else:
-         self.current_state = self.argument
 
       return tape_index
 
@@ -206,23 +188,66 @@ class SSHConfigMachine(StateMachine):
 
       return tape_index+1
 
+   def entry_whitespace(self, tape_index):
+      c = self.tape[tape_index]
+
+      if not self.current_keyword is None and self.current_argument is None and self.current_arguments is None:
+         raise StateError("unexpected end-of-line parsing %s for %s. (line %d)" % (self.current_keyword, ', '.join(self.current_hosts), self.current_line))
+      if c in self.ALL_WHITESPACE and self.current_keyword is None:
+         self.current_state = self.read_state
+         return tape_index
+
+      if self.current_argument:
+         self.current_argument = ''.join(self.current_argument)
+
+         if self.current_arguments is None:
+            self.current_arguments = [self.current_argument]
+         else:
+            self.current_arguments.append(self.current_argument)
+
+      self.store_keyword()
+      self.current_state = self.read_state
+
+      self.current_keyword = None
+      self.current_argument = None
+      self.current_arguments = None
+      self.current_line += 1
+
+      return tape_index+1
+
+   def line_whitespace(self, tape_index):
+      c = self.tape[tape_index]
+
+      if c in self.LINE_WHITESPACE:
+         return tape_index+1
+      elif c == '#':
+         self.current_state = self.comment
+      elif c in self.ENTRY_WHITESPACE:
+         self.current_state = self.entry_whitespace
+      else:
+         self.current_state = self.argument
+
+      return tape_index
+
    def store_keyword(self):
       if self.current_keyword == 'Host':
          self.current_hosts = self.current_arguments[:]
          return
 
       for host in self.current_hosts:
-         if '*' in host or '?' in host:
-            config = self.pattern_configs
-         else:
-            config = self.static_configs
+         if self.target_host:
+            if not SSHPatternMachine(host, self.target_host).match():
+               continue
 
-         host_store = config.setdefault(host, dict())
+            host = self.target_host
+
+         host_store = self.config.setdefault(host, dict())
 
          if not host_store.has_key(self.current_keyword):
             host_store[self.current_keyword] = self.current_arguments
-
-      #print self.current_hosts, self.current_keyword, self.current_arguments
+         else:
+            for argument in self.current_arguments:
+               host_store[self.current_keyword].append(argument)
 
    def argument(self, tape_index):
       c = self.tape[tape_index]
@@ -240,6 +265,9 @@ class SSHConfigMachine(StateMachine):
             self.current_argument = None
 
          self.current_state = self.line_whitespace
+      elif c == '"':
+         self.quote_count = 0
+         self.current_state = self.enclosed_argument
       else:
          if self.current_argument is None:
             self.current_argument = list()
@@ -250,33 +278,36 @@ class SSHConfigMachine(StateMachine):
       return tape_index
 
    def enclosed_argument(self, tape_index):
-      pass
-
-   def init_state(self, tape_index):
       c = self.tape[tape_index]
 
-      if c == '\n':
-         self.current_line += 1
+      if c == '"':
+         if not self.quote_count:
+            self.quote_count += 1
+         else:
+            self.current_state = self.read_state
 
-      if c in self.ALL_WHITESPACE:
          return tape_index+1
-      elif c == '#':
-         self.current_state = self.comment
-      else:
-         self.current_keyword = list()
-         self.current_state = self.keyword
-
-      return tape_index
-
-# states:
-#     init
-#     comment
-#     keyword token
-#     argument token
-#     pattern token
-#     host declaration
+      elif c == '\\':
+         self.current_state = self.escape_state
+         return tape_index
 
 if __name__ == '__main__':
-   ssh_machine = SSHConfigMachine("/home/purple/.ssh/config.harvest")
-   ssh_machine.run()
-   print ssh_machine.static_configs
+   if not len(sys.argv):
+      sys.stderr.write('no hosts given')
+      sys.exit(1)
+
+   for host_query in sys.argv[1:]:
+      ssh_machine = SSHConfigMachine("%s/.ssh/config" % os.environ['HOME'], host_query)
+      ssh_machine.run()
+
+      hosts = ssh_machine.config.keys()
+      hosts.sort()
+
+      for host in hosts:
+         print 'Host %s' % host
+
+         properties = ssh_machine.config[host].keys()
+         properties.sort()
+
+         for prop in properties:
+            print '\t%s %s' % (prop, ','.join(ssh_machine.config[host][prop]))
